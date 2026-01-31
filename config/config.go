@@ -345,6 +345,7 @@ type Configuration struct {
 
 	Api    ApiConfiguration    `json:"api" yaml:"api"`
 	System SystemConfiguration `json:"system" yaml:"system"`
+	// DockerConfiguration is referenced in the original file; keep the same field (type defined elsewhere).
 	Docker DockerConfiguration `json:"docker" yaml:"docker"`
 
 	// Defines internal throttling configurations for server processes to prevent
@@ -435,27 +436,24 @@ func SetDebugViaFlag(d bool) {
 // modifications is by using the Update() function and passing data through in
 // the callback.
 func Get() *Configuration {
-	// Fast path: return a copy if already set.
+	// Fast path: if config already set return a copy under read lock.
 	mu.RLock()
 	if _config != nil {
-		// make a copy while holding the read lock
 		c := *_config
 		mu.RUnlock()
 		return &c
 	}
 	mu.RUnlock()
 
-	// If we got here _config is nil. Initialize a default configuration so callers
-	// don't hit a nil pointer dereference. This avoids panics in code paths that
-	// expect a config to exist even if the file wasn't loaded yet.
+	// Slow path: initialize a default config to avoid nil pointer dereferences.
 	mu.Lock()
 	defer mu.Unlock()
 	if _config == nil {
 		c, err := NewAtPath(DefaultLocation)
 		if err != nil {
-			// Fatal: cannot create a reasonable default configuration. Panic with context
-			// so this is easy to diagnose during startup.
-			log.WithError(err).Panic("config: failed to create default configuration")
+			// Log and panic so the failure is obvious during startup.
+			log.WithError(err).Error("config: failed to create default configuration")
+			panic(err)
 		}
 		// Populate token fields from environment or defaults so callers that rely on
 		// tokens/jwt algorithm won't immediately fail.
@@ -469,15 +467,12 @@ func Get() *Configuration {
 		if c.Token.Token == "" {
 			c.Token.Token = c.AuthenticationToken
 		}
-		// Ensure jwt algorithm is initialized consistently with Set.
-		token := c.Token.Token
-		_jwtAlgo = jwt.NewHS256([]byte(token))
+		_jwtAlgo = jwt.NewHS256([]byte(c.Token.Token))
 		_config = c
 
 		log.Warn("config: no configuration loaded, using defaults from NewAtPath; consider loading a configuration file with FromFile()")
 	}
 
-	// return a copy
 	cc := *_config
 	return &cc
 }
@@ -533,9 +528,8 @@ func WriteToDisk(c *Configuration) error {
 // This function IS NOT thread safe and should only be called in the main thread
 // when the application is booting.
 func EnsurePterodactylUser() error {
-	// Ensure config exists so we don't nil-deref.
+	// If config not set, attempt to create a reasonable default set.
 	if _config == nil {
-		// Try to initialize a default config; if that fails return the error upstream.
 		c, err := NewAtPath(DefaultLocation)
 		if err != nil {
 			return err
@@ -788,8 +782,9 @@ func EnableLogRotation() error {
 	} else if (err != nil && os.IsNotExist(err)) || !st.IsDir() {
 		return nil
 	}
-	if _, err := os.Stat("/etc/logrotate.d/wings"); err == nil || !os.IsNotExist(err) {
-		return err
+	if _, err := os.Stat("/etc/logrotate.d/wings"); err == nil {
+		// already present; nothing to do
+		return nil
 	}
 
 	log.Info("no log rotation configuration found: adding file now")
