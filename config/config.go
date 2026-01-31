@@ -345,7 +345,7 @@ type Configuration struct {
 
 	Api    ApiConfiguration    `json:"api" yaml:"api"`
 	System SystemConfiguration `json:"system" yaml:"system"`
-	// DockerConfiguration is referenced in the original file; keep the same field (type defined elsewhere).
+	// DockerConfiguration type is referenced by other files; keep the same field.
 	Docker DockerConfiguration `json:"docker" yaml:"docker"`
 
 	// Defines internal throttling configurations for server processes to prevent
@@ -402,8 +402,14 @@ func Set(c *Configuration) {
 		c.Token.Token = c.AuthenticationToken
 		token = c.Token.Token
 	}
+	// Only (re)create jwt algorithm when token is non-empty. If token is empty,
+	// leave _jwtAlgo nil to avoid jwt library panics.
 	if _config == nil || _config.Token.Token != token {
-		_jwtAlgo = jwt.NewHS256([]byte(token))
+		if token != "" {
+			_jwtAlgo = jwt.NewHS256([]byte(token))
+		} else {
+			_jwtAlgo = nil
+		}
 	}
 	_config = c
 }
@@ -467,7 +473,12 @@ func Get() *Configuration {
 		if c.Token.Token == "" {
 			c.Token.Token = c.AuthenticationToken
 		}
-		_jwtAlgo = jwt.NewHS256([]byte(c.Token.Token))
+		// Only initialize jwt algorithm if we actually have a key.
+		if c.Token.Token != "" {
+			_jwtAlgo = jwt.NewHS256([]byte(c.Token.Token))
+		} else {
+			_jwtAlgo = nil
+		}
 		_config = c
 
 		log.Warn("config: no configuration loaded, using defaults from NewAtPath; consider loading a configuration file with FromFile()")
