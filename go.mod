@@ -141,3 +141,5 @@ require (
 	modernc.org/memory v1.8.2 // indirect
 	modernc.org/sqlite v1.36.0 // indirect
 )
+replace github.com/pterodactyl/wings => .
+
