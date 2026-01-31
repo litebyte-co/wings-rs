@@ -413,6 +413,16 @@ func Set(c *Configuration) {
 func SetDebugViaFlag(d bool) {
 	mu.Lock()
 	defer mu.Unlock()
+	// If _config is nil, initialize a default configuration to avoid nil derefs.
+	if _config == nil {
+		c, err := NewAtPath(DefaultLocation)
+		if err != nil {
+			// If we cannot initialize, just set the flag sentinel and return.
+			_debugViaFlag = d
+			return
+		}
+		_config = c
+	}
 	_config.Debug = d
 	_debugViaFlag = d
 }
@@ -425,13 +435,51 @@ func SetDebugViaFlag(d bool) {
 // modifications is by using the Update() function and passing data through in
 // the callback.
 func Get() *Configuration {
+	// Fast path: return a copy if already set.
 	mu.RLock()
-	// Create a copy of the struct so that all modifications made beyond this
-	// point are immutable.
-	//goland:noinspection GoVetCopyLock
-	c := *_config
+	if _config != nil {
+		// make a copy while holding the read lock
+		c := *_config
+		mu.RUnlock()
+		return &c
+	}
 	mu.RUnlock()
-	return &c
+
+	// If we got here _config is nil. Initialize a default configuration so callers
+	// don't hit a nil pointer dereference. This avoids panics in code paths that
+	// expect a config to exist even if the file wasn't loaded yet.
+	mu.Lock()
+	defer mu.Unlock()
+	if _config == nil {
+		c, err := NewAtPath(DefaultLocation)
+		if err != nil {
+			// Fatal: cannot create a reasonable default configuration. Panic with context
+			// so this is easy to diagnose during startup.
+			log.WithError(err).Panic("config: failed to create default configuration")
+		}
+		// Populate token fields from environment or defaults so callers that rely on
+		// tokens/jwt algorithm won't immediately fail.
+		c.Token = Token{
+			ID:    os.Getenv("WINGS_TOKEN_ID"),
+			Token: os.Getenv("WINGS_TOKEN"),
+		}
+		if c.Token.ID == "" {
+			c.Token.ID = c.AuthenticationTokenId
+		}
+		if c.Token.Token == "" {
+			c.Token.Token = c.AuthenticationToken
+		}
+		// Ensure jwt algorithm is initialized consistently with Set.
+		token := c.Token.Token
+		_jwtAlgo = jwt.NewHS256([]byte(token))
+		_config = c
+
+		log.Warn("config: no configuration loaded, using defaults from NewAtPath; consider loading a configuration file with FromFile()")
+	}
+
+	// return a copy
+	cc := *_config
+	return &cc
 }
 
 // Update performs an in-situ update of the global configuration object using
@@ -485,6 +533,16 @@ func WriteToDisk(c *Configuration) error {
 // This function IS NOT thread safe and should only be called in the main thread
 // when the application is booting.
 func EnsurePterodactylUser() error {
+	// Ensure config exists so we don't nil-deref.
+	if _config == nil {
+		// Try to initialize a default config; if that fails return the error upstream.
+		c, err := NewAtPath(DefaultLocation)
+		if err != nil {
+			return err
+		}
+		Set(c)
+	}
+
 	sysName, err := getSystemName()
 	if err != nil {
 		return err
@@ -551,6 +609,15 @@ func EnsurePterodactylUser() error {
 
 // ConfigurePasswd generates required passwd files for use with containers started by Wings.
 func ConfigurePasswd() error {
+	// Ensure config exists
+	if _config == nil {
+		c, err := NewAtPath(DefaultLocation)
+		if err != nil {
+			return err
+		}
+		Set(c)
+	}
+
 	passwd := _config.System.Passwd
 	if !passwd.Enable {
 		return nil
@@ -627,6 +694,15 @@ func FromFile(path string) error {
 //
 // This function IS NOT thread-safe.
 func ConfigureDirectories() error {
+	// Ensure config exists
+	if _config == nil {
+		c, err := NewAtPath(DefaultLocation)
+		if err != nil {
+			return err
+		}
+		Set(c)
+	}
+
 	root := _config.System.RootDirectory
 	log.WithField("path", root).Debug("ensuring root data directory exists")
 	if err := os.MkdirAll(root, 0o700); err != nil {
@@ -693,6 +769,15 @@ func ConfigureDirectories() error {
 //
 // This function IS NOT thread-safe.
 func EnableLogRotation() error {
+	// Ensure config exists
+	if _config == nil {
+		c, err := NewAtPath(DefaultLocation)
+		if err != nil {
+			return err
+		}
+		Set(c)
+	}
+
 	if !_config.System.EnableLogRotate {
 		log.Info("skipping log rotate configuration, disabled in wings config file")
 		return nil
@@ -747,6 +832,15 @@ func (sc *SystemConfiguration) GetStatesPath() string {
 //
 // This function IS NOT thread-safe.
 func ConfigureTimezone() error {
+	// Ensure config exists
+	if _config == nil {
+		c, err := NewAtPath(DefaultLocation)
+		if err != nil {
+			return err
+		}
+		Set(c)
+	}
+
 	tz := os.Getenv("TZ")
 	if _config.System.Timezone == "" && tz != "" {
 		_config.System.Timezone = tz
@@ -856,7 +950,7 @@ func Expand(v string) (string, error) {
 
 		b, err := os.ReadFile(p)
 		if err != nil {
-			return "", nil
+			return "", err
 		}
 		v = string(bytes.TrimRight(bytes.TrimRight(b, "\r"), "\n"))
 	}
