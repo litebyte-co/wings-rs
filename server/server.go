@@ -149,9 +149,18 @@ func (s *Server) Context() context.Context {
 // Returns all of the environment variables that should be assigned to a running
 // server instance.
 func (s *Server) GetEnvironmentVariables() []string {
+	// Check if the server has a timezone configured from the Panel
+	serverTimezone := s.Config().EnvVars.Get("TZ")
+	if serverTimezone == "" {
+		serverTimezone = s.Config().EnvVars.Get("timezone")
+	}
+	if serverTimezone == "" {
+		// Default to Mexico City time if no server-specific timezone is set
+		serverTimezone = "America/Mexico_City"
+	}
+
 	out := []string{
-		// TODO: allow this to be overridden by the user.
-		fmt.Sprintf("TZ=%s", config.Get().System.Timezone),
+		fmt.Sprintf("TZ=%s", serverTimezone),
 		fmt.Sprintf("STARTUP=%s", s.Config().Invocation),
 		fmt.Sprintf("SERVER_MEMORY=%d", s.MemoryLimit()),
 		fmt.Sprintf("SERVER_IP=%s", s.Config().Allocations.DefaultMapping.Ip),
@@ -160,6 +169,11 @@ func (s *Server) GetEnvironmentVariables() []string {
 
 eloop:
 	for k := range s.Config().EnvVars {
+		// Skip timezone variables as they are handled above
+		if strings.ToLower(k) == "tz" || strings.ToLower(k) == "timezone" {
+			continue eloop
+		}
+
 		// Don't allow any environment variables that we have already set above.
 		for _, e := range out {
 			if strings.HasPrefix(e, strings.ToUpper(k)+"=") {
