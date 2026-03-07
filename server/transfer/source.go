@@ -51,6 +51,7 @@ func (t *Transfer) PushArchiveToTarget(url, token string) ([]byte, error) {
 	body, writer := io.Pipe()
 	defer body.Close()
 	defer writer.Close()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
 	if err != nil {
 		return nil, err
@@ -60,22 +61,19 @@ func (t *Transfer) PushArchiveToTarget(url, token string) ([]byte, error) {
 	// Create a new multipart writer that writes the archive to the pipe.
 	mp := multipart.NewWriter(writer)
 	defer mp.Close()
+
 	req.Header.Set("Content-Type", mp.FormDataContentType())
 
 	// Create a new goroutine to write the archive to the pipe used by the
 	// multipart writer.
 	errChan := make(chan error)
+
 	go func() {
 		defer close(errChan)
 		defer writer.Close()
 		defer mp.Close()
 
-		src, pw := io.Pipe()
-		defer src.Close()
-		defer pw.Close()
-
 		h := sha256.New()
-		tee := io.TeeReader(src, h)
 
 		dest, err := mp.CreateFormFile("archive", "archive.tar.gz")
 		if err != nil {
@@ -83,33 +81,15 @@ func (t *Transfer) PushArchiveToTarget(url, token string) ([]byte, error) {
 			return
 		}
 
-		ch := make(chan error)
-		go func() {
-			defer close(ch)
+		// Write archive to both multipart and hash simultaneously.
+		mw := io.MultiWriter(dest, h)
 
-			if _, err := io.Copy(dest, tee); err != nil {
-				ch <- fmt.Errorf("failed to stream archive to destination: %w", err)
-				return
-			}
-
-			t.Log().Debug("finished copying dest to tee")
-		}()
-
-		if err := a.Stream(ctx, pw); err != nil {
-			errChan <- errors.New("failed to stream archive to pipe")
+		if err := a.Stream(ctx, mw); err != nil {
+			errChan <- errors.New("failed to stream archive to destination")
 			return
 		}
-		t.Log().Debug("finished streaming archive to pipe")
 
-		// Close the pipe writer early to release resources and ensure that the data gets flushed.
-		_ = pw.Close()
-
-		// Wait for the copy to finish before we continue.
-		t.Log().Debug("waiting on copy to finish")
-		if err := <-ch; err != nil {
-			errChan <- err
-			return
-		}
+		t.Log().Debug("finished streaming archive to destination")
 
 		if err := mp.WriteField("checksum", hex.EncodeToString(h.Sum(nil))); err != nil {
 			errChan <- errors.New("failed to stream checksum")
@@ -122,25 +102,33 @@ func (t *Transfer) PushArchiveToTarget(url, token string) ([]byte, error) {
 		if err := mp.Close(); err != nil {
 			t.Log().WithError(err).Error("error while closing multipart writer")
 		}
+
 		t.Log().Debug("closed multipart writer")
 	}()
 
 	t.Log().Debug("sending archive to destination")
+
 	client := http.Client{Timeout: 0}
+
 	res, err := client.Do(req)
 	if err != nil {
 		t.Log().Debug("error while sending archive to destination")
 		return nil, err
 	}
+
 	if res.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("unexpected status code from destination: %d", res.StatusCode)
 	}
+
 	t.Log().Debug("waiting for stream to complete")
+
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
+
 	case err2 := <-errChan:
 		t.Log().Debug("stream completed")
+
 		if err != nil || err2 != nil {
 			if err == context.Canceled {
 				return nil, err
@@ -149,7 +137,9 @@ func (t *Transfer) PushArchiveToTarget(url, token string) ([]byte, error) {
 			t.Log().WithError(err).Debug("failed to send archive to destination")
 			return nil, fmt.Errorf("http error: %w, multipart error: %v", err, err2)
 		}
+
 		defer res.Body.Close()
+
 		t.Log().Debug("received response from destination")
 
 		v, err := io.ReadAll(res.Body)
