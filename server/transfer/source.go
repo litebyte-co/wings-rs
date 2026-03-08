@@ -11,7 +11,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/0x7d8/wings/internal/progress"
+	"github.com/pterodactyl/wings/internal/progress"
 )
 
 // PushArchiveToTarget POSTs the archive to the target node and returns the
@@ -34,7 +34,6 @@ func (t *Transfer) PushArchiveToTarget(url, token string) ([]byte, error) {
 	// Send the upload progress to the websocket every 5 seconds.
 	ctx2, cancel2 := context.WithCancel(ctx)
 	defer cancel2()
-
 	go func(ctx context.Context, p *progress.Progress, tc *time.Ticker) {
 		defer tc.Stop()
 
@@ -52,22 +51,20 @@ func (t *Transfer) PushArchiveToTarget(url, token string) ([]byte, error) {
 	body, writer := io.Pipe()
 	defer body.Close()
 	defer writer.Close()
-
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
 	if err != nil {
 		return nil, err
 	}
-
 	req.Header.Set("Authorization", token)
 
-	// Create multipart writer
+	// Create a new multipart writer that writes the archive to the pipe.
 	mp := multipart.NewWriter(writer)
 	defer mp.Close()
-
 	req.Header.Set("Content-Type", mp.FormDataContentType())
 
+	// Create a new goroutine to write the archive to the pipe used by the
+	// multipart writer.
 	errChan := make(chan error)
-
 	go func() {
 		defer close(errChan)
 		defer writer.Close()
@@ -86,13 +83,12 @@ func (t *Transfer) PushArchiveToTarget(url, token string) ([]byte, error) {
 			return
 		}
 
-		copyDone := make(chan error)
-
+		ch := make(chan error)
 		go func() {
-			defer close(copyDone)
+			defer close(ch)
 
 			if _, err := io.Copy(dest, tee); err != nil {
-				copyDone <- fmt.Errorf("failed to stream archive to destination: %w", err)
+				ch <- fmt.Errorf("failed to stream archive to destination: %w", err)
 				return
 			}
 
@@ -103,14 +99,14 @@ func (t *Transfer) PushArchiveToTarget(url, token string) ([]byte, error) {
 			errChan <- errors.New("failed to stream archive to pipe")
 			return
 		}
-
 		t.Log().Debug("finished streaming archive to pipe")
 
+		// Close the pipe writer early to release resources and ensure that the data gets flushed.
 		_ = pw.Close()
 
+		// Wait for the copy to finish before we continue.
 		t.Log().Debug("waiting on copy to finish")
-
-		if err := <-copyDone; err != nil {
+		if err := <-ch; err != nil {
 			errChan <- err
 			return
 		}
@@ -126,33 +122,25 @@ func (t *Transfer) PushArchiveToTarget(url, token string) ([]byte, error) {
 		if err := mp.Close(); err != nil {
 			t.Log().WithError(err).Error("error while closing multipart writer")
 		}
-
 		t.Log().Debug("closed multipart writer")
 	}()
 
 	t.Log().Debug("sending archive to destination")
-
 	client := http.Client{Timeout: 0}
-
 	res, err := client.Do(req)
 	if err != nil {
 		t.Log().Debug("error while sending archive to destination")
 		return nil, err
 	}
-
 	if res.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("unexpected status code from destination: %d", res.StatusCode)
 	}
-
 	t.Log().Debug("waiting for stream to complete")
-
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-
 	case err2 := <-errChan:
 		t.Log().Debug("stream completed")
-
 		if err != nil || err2 != nil {
 			if err == context.Canceled {
 				return nil, err
@@ -161,9 +149,7 @@ func (t *Transfer) PushArchiveToTarget(url, token string) ([]byte, error) {
 			t.Log().WithError(err).Debug("failed to send archive to destination")
 			return nil, fmt.Errorf("http error: %w, multipart error: %v", err, err2)
 		}
-
 		defer res.Body.Close()
-
 		t.Log().Debug("received response from destination")
 
 		v, err := io.ReadAll(res.Body)
