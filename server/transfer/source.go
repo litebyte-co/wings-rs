@@ -34,6 +34,7 @@ func (t *Transfer) PushArchiveToTarget(url, token string) ([]byte, error) {
 	// Send the upload progress to the websocket every 5 seconds.
 	ctx2, cancel2 := context.WithCancel(ctx)
 	defer cancel2()
+
 	go func(ctx context.Context, p *progress.Progress, tc *time.Ticker) {
 		defer tc.Stop()
 
@@ -56,16 +57,15 @@ func (t *Transfer) PushArchiveToTarget(url, token string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	req.Header.Set("Authorization", token)
 
-	// Create a new multipart writer that writes the archive to the pipe.
+	// Create multipart writer
 	mp := multipart.NewWriter(writer)
 	defer mp.Close()
 
 	req.Header.Set("Content-Type", mp.FormDataContentType())
 
-	// Create a new goroutine to write the archive to the pipe used by the
-	// multipart writer.
 	errChan := make(chan error)
 
 	go func() {
@@ -73,7 +73,12 @@ func (t *Transfer) PushArchiveToTarget(url, token string) ([]byte, error) {
 		defer writer.Close()
 		defer mp.Close()
 
+		src, pw := io.Pipe()
+		defer src.Close()
+		defer pw.Close()
+
 		h := sha256.New()
+		tee := io.TeeReader(src, h)
 
 		dest, err := mp.CreateFormFile("archive", "archive.tar.gz")
 		if err != nil {
@@ -81,15 +86,34 @@ func (t *Transfer) PushArchiveToTarget(url, token string) ([]byte, error) {
 			return
 		}
 
-		// Write archive to both multipart and hash simultaneously.
-		mw := io.MultiWriter(dest, h)
+		copyDone := make(chan error)
 
-		if err := a.Stream(ctx, mw); err != nil {
-			errChan <- errors.New("failed to stream archive to destination")
+		go func() {
+			defer close(copyDone)
+
+			if _, err := io.Copy(dest, tee); err != nil {
+				copyDone <- fmt.Errorf("failed to stream archive to destination: %w", err)
+				return
+			}
+
+			t.Log().Debug("finished copying dest to tee")
+		}()
+
+		if err := a.Stream(ctx, pw); err != nil {
+			errChan <- errors.New("failed to stream archive to pipe")
 			return
 		}
 
-		t.Log().Debug("finished streaming archive to destination")
+		t.Log().Debug("finished streaming archive to pipe")
+
+		_ = pw.Close()
+
+		t.Log().Debug("waiting on copy to finish")
+
+		if err := <-copyDone; err != nil {
+			errChan <- err
+			return
+		}
 
 		if err := mp.WriteField("checksum", hex.EncodeToString(h.Sum(nil))); err != nil {
 			errChan <- errors.New("failed to stream checksum")
